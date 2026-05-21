@@ -331,7 +331,123 @@ ID は実装と運用で読みやすい文字列 ID を基本とする。給水�
 
 削除は、ユーザー投稿や緊急連絡のように運用上復元・確認が必要になり得るデータでは `deleted_at` による論理削除を基本とする。給水機マスタは MVP では物理削除も許容するが、QR コードと紐づいた給水機は `is_public = 0` による非公開化を優先する。
 
-### 4.2 campuses
+### 4.2 ER Diagram
+
+```mermaid
+erDiagram
+  campuses {
+    text id PK
+    text name
+    text map_image_path
+    integer map_width
+    integer map_height
+    datetime created_at
+    datetime updated_at
+  }
+
+  buildings {
+    text id PK
+    text campus_id FK
+    text name
+    integer sort_order
+    datetime created_at
+    datetime updated_at
+  }
+
+  stations {
+    text id PK
+    text campus_id FK
+    text building_id FK
+    text name
+    text description
+    real relative_x
+    real relative_y
+    text status
+    text short_link_id
+    text short_link_url
+    integer is_public
+    datetime created_at
+    datetime updated_at
+  }
+
+  station_temperatures {
+    text station_id PK, FK
+    text temperature_type PK
+    datetime created_at
+  }
+
+  installation_targets {
+    text id PK
+    text campus_id FK
+    text building_id FK
+    integer vote_count
+    datetime created_at
+    datetime updated_at
+  }
+
+  installation_votes {
+    text id PK
+    text target_id FK
+    text voter_token_hash
+    datetime created_at
+  }
+
+  installation_comments {
+    text id PK
+    text target_id FK
+    text comment
+    datetime created_at
+    datetime deleted_at
+  }
+
+  emergency_contacts {
+    text id PK
+    text station_id FK
+    text issue_type
+    text message
+    text reporter_email
+    datetime admin_email_sent_at
+    datetime auto_reply_sent_at
+    text auto_reply_error
+    datetime created_at
+    datetime deleted_at
+  }
+
+  analytics_events {
+    text id PK
+    text event_name
+    text station_id FK
+    text campus_id FK
+    text building_id FK
+    text source
+    text metadata_json
+    text environment
+    datetime created_at
+  }
+
+  admin_audit_events {
+    text id PK
+    text action
+    text target_type
+    text target_id
+    datetime created_at
+  }
+
+  campuses ||--o{ buildings : has
+  campuses ||--o{ stations : has
+  buildings ||--o{ stations : contains
+  stations ||--o{ station_temperatures : supports
+  campuses ||--o{ installation_targets : has
+  buildings ||--o{ installation_targets : requested_for
+  installation_targets ||--o{ installation_votes : receives
+  installation_targets ||--o{ installation_comments : has
+  stations ||--o{ emergency_contacts : receives
+  stations ||--o{ analytics_events : tracked_by
+  campuses ||--o{ analytics_events : tracked_by
+  buildings ||--o{ analytics_events : tracked_by
+```
+
+### 4.3 campuses
 
 キャンパス情報を保持する。
 
@@ -343,7 +459,7 @@ ID は実装と運用で読みやすい文字列 ID を基本とする。給水�
 - `created_at`: datetime
 - `updated_at`: datetime
 
-### 4.3 buildings
+### 4.4 buildings
 
 建物一覧を保持する。MVP では seed データとして管理する。
 
@@ -359,7 +475,7 @@ ID は実装と運用で読みやすい文字列 ID を基本とする。給水�
 - `campus_id`, `name` の組み合わせは一意にする。
 - `campus_id`, `sort_order` にインデックスを貼る。
 
-### 4.4 stations
+### 4.5 stations
 
 給水機情報を保持する。
 
@@ -386,7 +502,7 @@ MVP の必須項目は、キャンパス、建物、名称、相対座標、状�
 - `campus_id`, `building_id` にインデックスを貼る。
 - `short_link_url` は登録される場合、一意にする。
 
-### 4.5 station_temperatures
+### 4.6 station_temperatures
 
 給水機が対応する水温種別を保持する JOIN テーブル。
 
@@ -408,7 +524,7 @@ MVP の必須項目は、キャンパス、建物、名称、相対座標、状�
 
 MVP では水温ごとの個別状態は持たない。必要になった場合は、このテーブルに `status` を追加するか、別途 `station_temperature_statuses` テーブルへ移行する。
 
-### 4.6 installation_targets
+### 4.7 installation_targets
 
 設置希望の建物単位集約を表す。建物ごとに 1 件を基本とする。
 
@@ -426,7 +542,7 @@ MVP では水温ごとの個別状態は持たない。必要になった場合�
 - `campus_id`, `building_id` の組み合わせは一意にする。
 - `vote_count` は `installation_votes` から再集計可能だが、MVP では一覧表示を軽くするためキャッシュ値として保持する。
 
-### 4.7 installation_votes
+### 4.8 installation_votes
 
 投票履歴を保持する。
 
@@ -444,7 +560,7 @@ Cookie の生値は DB に保存しない。DB にはハッシュ化した識別
 - `target_id`, `created_at`
 - `target_id`, `voter_token_hash`, `created_at`
 
-### 4.8 installation_comments
+### 4.9 installation_comments
 
 設置希望に紐づく管理者向けコメントを保持する。
 
@@ -461,7 +577,7 @@ MVP ではコメントを一般公開しない。公開側にはキャンパス�
 - `target_id`, `created_at`
 - `deleted_at`
 
-### 4.9 emergency_contacts
+### 4.10 emergency_contacts
 
 緊急連絡を保持する。
 
@@ -484,7 +600,7 @@ MVP では写真添付を扱わない。
 - `created_at`
 - `deleted_at`
 
-### 4.10 analytics_events
+### 4.11 analytics_events
 
 必要最小限のイベントを保存する。
 
@@ -514,7 +630,7 @@ MVP で優先して保存するイベントは以下とする。
 - `station_id`, `created_at`
 - `environment`, `created_at`
 
-### 4.11 admin_audit_events
+### 4.12 admin_audit_events
 
 MVP では詳細な監査ログは対象外だが、基本ログだけは軽く残せる構成にする。
 
