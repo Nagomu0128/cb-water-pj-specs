@@ -76,7 +76,6 @@ MVP では以下を同一アプリケーション内に実装する。
 - 個別管理者アカウント。
 - 管理画面の詳細な監査ログ。
 - 緊急連絡フォームの写真添付。
-- ユーザーへの自動返信メール。
 
 ## 2. Architecture
 
@@ -192,7 +191,8 @@ Decision:
 - フォームを送信する。
 - アプリは D1 に緊急連絡を保存する。
 - Resend 経由で `carry.my.bottle@gmail.com` に通知する。
-- MVP ではユーザーへの自動返信は送らず、画面上に送信完了を表示する。
+- Resend 経由で連絡者メールアドレスに送信完了メールまたは自動返信を送る。
+- 画面上にも送信完了を表示する。
 
 ## 4. Data Model
 
@@ -352,7 +352,9 @@ MVP ではコメントを一般公開しない。公開側にはキャンパス�
 - `issue_type`: text。`broken`, `stopped`, `no_water`, `leak_or_abnormal`, `other`
 - `message`: text
 - `reporter_email`: text
-- `email_sent_at`: datetime, nullable
+- `admin_email_sent_at`: datetime, nullable
+- `auto_reply_sent_at`: datetime, nullable
+- `auto_reply_error`: text, nullable
 - `created_at`: datetime
 - `deleted_at`: datetime, nullable
 
@@ -587,8 +589,8 @@ Decision:
 
 - MVP では写真添付を扱わない。
 - 入力項目は給水機、issue type、内容、連絡者メールアドレスとする。
-- ユーザーへの自動返信メールは MVP 対象外とする。
-- 送信完了は画面上で表示する。
+- 連絡者メールアドレスは、送信完了メールまたは自動返信の送信先として必須にする。
+- 送信完了は画面上で表示し、あわせて Resend 経由でユーザーにもメール通知する。
 
 issue type は以下とする。
 
@@ -606,9 +608,13 @@ issue type は以下とする。
 - D1 の `emergency_contacts` に保存する。
 - Resend 経由で `carry.my.bottle@gmail.com` に通知する。
 - 通知メールには、給水機名、キャンパス、建物、issue type、本文、連絡者メールアドレス、管理画面 URL を含める。
+- Resend 経由で連絡者メールアドレスに送信完了メールまたは自動返信を送る。
+- 自動返信メールには、受付完了、対象給水機、issue type、問い合わせ内容の控え、キャリボトから必要に応じて連絡する可能性がある旨を含める。
 - 送信成功後、画面に完了メッセージを表示する。
 
 Resend の API key は Cloudflare の環境変数で管理する。
+
+管理者通知の送信に成功し、ユーザー向け自動返信だけが失敗した場合でも、フォーム送信自体は成功扱いとする。その場合は `emergency_contacts` に自動返信失敗を確認できる情報を残す。
 
 ### 8.3 Spam Prevention
 
@@ -912,6 +918,7 @@ Decision:
 - `SESSION_SECRET`
 - `RESEND_API_KEY`
 - `EMERGENCY_CONTACT_TO`
+- `EMERGENCY_CONTACT_FROM`
 - `VOTE_TOKEN_SECRET`
 
 D1 binding 名や Cloudflare 固有設定は実装時の `wrangler` / OpenNext 設定に合わせて決定する。
@@ -943,6 +950,7 @@ MVP では、ここまで合意した広めの範囲を必須として扱う。
 - 管理者向けコメント保存。
 - 緊急連絡フォーム。
 - Resend による管理者通知。
+- Resend によるユーザーへの送信完了メールまたは自動返信。
 - 管理画面。
 - 共有パスワードハッシュ + セッション Cookie 認証。
 - ビジュアル座標エディタ。
@@ -964,6 +972,7 @@ MVP の完了条件:
 - production と development の D1 が分離されている。
 - 本番データを development から誤って更新しない構成になっている。
 - 緊急連絡メールが管理者宛に届く。
+- 緊急連絡後、ユーザーに送信完了メールまたは自動返信が届く。
 - 主要な残リスクが README または運用メモではなく、本 Design Doc 上で確認できる。
 
 ### 14.2 MVP Fallback
@@ -1014,7 +1023,6 @@ Fallback 方針:
 - 最寄り給水機の自動算出。
 - ルート案内。
 - 緊急連絡フォームの写真添付。
-- ユーザーへの自動返信メール。
 - Cloudflare Turnstile。
 - 投稿・投票の認証強化。
 - 個別管理者アカウント。
@@ -1138,14 +1146,15 @@ Mitigation:
 
 Risk:
 
-Resend から `carry.my.bottle@gmail.com` への通知が迷惑メール扱いになったり、送信元ドメイン設定が未完了で送信できない可能性がある。
+Resend から `carry.my.bottle@gmail.com` への管理者通知、または連絡者メールアドレスへの自動返信が迷惑メール扱いになったり、送信元ドメイン設定が未完了で送信できない可能性がある。
 
 Mitigation:
 
 - 早期に Resend の送信テストを行う。
 - development では件名に `[DEV]` を付ける。
 - production では送信元ドメイン設定を確認する。
-- 送信失敗時も D1 に緊急連絡データを保存し、管理画面から確認できるようにする。
+- 管理者通知の送信失敗時も D1 に緊急連絡データを保存し、管理画面から確認できるようにする。
+- ユーザー向け自動返信の送信失敗時はフォーム送信自体を成功扱いにし、管理画面で失敗状態を確認できるようにする。
 
 ### 15.10 Data Loss and Migration Risk
 
