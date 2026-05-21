@@ -85,7 +85,7 @@ Decision:
 
 - アプリケーションは Next.js フルスタック構成とする。
 - ホスティングと実行基盤は Cloudflare を前提とする。
-- Next.js を Cloudflare で動かす方式は OpenNext for Cloudflare を第一候補とする。
+- Next.js を Cloudflare で動かす方式は OpenNext for Cloudflare を使用する。
 - DB は Cloudflare D1 を使用する。
 - メール送信は Resend を使用する。
 - 短縮リンクは `url.gdgs.jp` を使用する。
@@ -450,11 +450,14 @@ Decision:
 
 実装方針:
 
+- ピンチズーム・パンの実装は `react-zoom-pan-pinch` を第一候補として採用する。
 - 地図全体を `MapViewport` と `MapCanvas` に分ける。
 - `MapCanvas` に対して scale と translate を適用する。
 - 画像とピンは `MapCanvas` の子要素として配置する。
 - タッチ操作とマウス操作の両方に対応する。
 - MVP では過度な慣性スクロールや高度なアニメーションは不要とする。
+
+実装初期に、`react-zoom-pan-pinch` で画像と相対座標ピンが同じ変換コンテナ内でずれずに表示できることを検証する。相性が悪い場合のみ Pointer Events による自前実装へ切り替える。
 
 Fallback:
 
@@ -618,7 +621,15 @@ Resend の API key は Cloudflare の環境変数で管理する。
 
 ### 8.3 Spam Prevention
 
-MVP ではサーバー側レート制限を行う。Cloudflare Turnstile や CAPTCHA は MVP では必須にしない。
+MVP ではアプリ側の簡易レート制限と Cloudflare 側設定を併用する。Cloudflare Turnstile や CAPTCHA は MVP では必須にしない。
+
+対象:
+
+- 緊急連絡フォーム送信。
+- 設置希望の投票。
+- 管理画面ログイン試行。
+
+閾値は Design Doc では固定せず、環境変数または設定値として実装時に調整可能にする。初期値は実装時に安全側で設定し、実運用の状況を見て緩和または強化する。
 
 Fallback:
 
@@ -634,6 +645,7 @@ Decision:
 - MVP で管理画面を提供する。
 - 給水機管理、設置希望管理、緊急連絡管理を対象とする。
 - 給水機のビジュアル座標エディタを MVP に含める。
+- 管理画面 UI は `shadcn/ui + Tailwind CSS` を採用する。
 
 管理画面で可能にする操作:
 
@@ -678,6 +690,14 @@ Decision:
 - 一致した場合、署名付きセッション Cookie を発行する。
 - `/admin` 配下では Cookie を検証してログイン状態を確認する。
 - ログアウト時は Cookie を削除する。
+
+ハッシュ方式:
+
+- `PBKDF2-SHA256 + salt` を採用する。
+- ハッシュ生成用スクリプトをリポジトリに用意する。
+- 生成した `ADMIN_PASSWORD_HASH` と `ADMIN_PASSWORD_SALT` は `wrangler secret` で Cloudflare 環境ごとに登録する。
+- 入力パスワードの検証では、同じ salt と iteration 設定で PBKDF2-SHA256 を実行し、定数時間比較を行う。
+- iteration 数は実装時の実行時間を確認し、Cloudflare 実行環境で過度に重くならない値にする。
 
 Cookie 属性:
 
@@ -779,6 +799,8 @@ Decision:
 - MVP では短縮リンクを手動発行する。
 - `station_id` と短縮リンクの対応表を D1 / 管理画面で管理する。
 - 管理画面から station ごとに `short_link_id` と `short_link_url` を確認・編集できるようにする。
+- MVP では GDG 側が `url.gdgs.jp` の作成・変更権限を持つ。
+- キャリボト側は短縮リンクの変更が必要な場合、GDG 側へ変更依頼する。
 
 運用フロー:
 
@@ -788,6 +810,13 @@ Decision:
 - 遷移先 URL に `source=qr&station_id=...` を付与する。
 - 作成した短縮リンクを管理画面に登録する。
 - QR コードを生成し、給水機に掲示する。
+
+リンク先変更フロー:
+
+- キャリボトまたは運用担当者が変更理由と変更先 URL を整理する。
+- GDG 側の短縮リンク管理者が `url.gdgs.jp` の遷移先を更新する。
+- 更新後、実機で QR コードを読み取り、正しい給水機詳細または指定ページへ遷移することを確認する。
+- 変更日時、対象 station_id、変更前後の URL を運用メモまたは管理画面の備考に残す。
 
 MVP では QR コード自動生成・短縮リンク自動発行は行わない。
 
@@ -866,6 +895,21 @@ MVP では Cookie 同意バナーは必須にしない。代わりに、フッ�
 
 ## 13. Deployment and Environments
 
+### 13.0 Next.js Runtime
+
+Decision:
+
+- Cloudflare 上で Next.js を実行する方式として OpenNext for Cloudflare を採用する。
+- LP、マップ、管理画面、Route Handlers、Cookie 認証、D1 アクセスを同一 Next.js アプリで扱う。
+- 実装初期に、OpenNext for Cloudflare 上で Route Handlers、D1 binding、Cookie、Resend 送信が動くことを確認する。
+
+OpenNext 採用後も、Cloudflare 実行環境の制約は維持する。
+
+- Node.js 固有 API に依存しすぎない。
+- ファイルシステム書き込みを前提にしない。
+- 長時間処理を避ける。
+- 画像最適化など、Vercel 前提の機能に強く依存しない。
+
 ### 13.1 Branch and Environment Policy
 
 Decision:
@@ -898,6 +942,24 @@ MVP では共通利用を許容するもの:
 
 Resend を共通利用する場合、開発環境から送るメール件名には `[DEV]` を付ける。イベント保存時も `environment` を保存し、本番データと開発データを混同しない。
 
+### 13.2.1 D1 Migration and Seed
+
+Decision:
+
+- D1 migration は Wrangler migrations で管理する。
+- 初期データ投入は seed scripts で管理する。
+- production と development の D1 database は分離する。
+- アプリ内の D1 binding 名は環境に関わらず `DB` で統一する。
+- `wrangler env` により `development` / `production` の接続先 D1 を切り替える。
+
+運用方針:
+
+- schema 変更は migration として履歴管理する。
+- 初期キャンパス、建物、給水機データは seed scripts で投入する。
+- 本番運用開始後の seed は破壊的に実行しない。
+- 本番 migration 前に development で適用確認する。
+- seed scripts は冪等性を意識し、同じ seed を複数回実行しても重複が発生しない設計にする。
+
 ### 13.3 Domain
 
 Decision:
@@ -921,7 +983,9 @@ Decision:
 - `EMERGENCY_CONTACT_FROM`
 - `VOTE_TOKEN_SECRET`
 
-D1 binding 名や Cloudflare 固有設定は実装時の `wrangler` / OpenNext 設定に合わせて決定する。
+D1 binding 名は `DB` に統一する。Cloudflare 固有設定は `wrangler env` で `development` / `production` を分ける。
+
+Resend の送信元は、MVP では Resend のデフォルト送信元を許容する。ただし、迷惑メールや到達性のリスクがあるため、本公開前または運用安定化の段階で独自ドメイン認証を検討する。
 
 ## 14. MVP Scope, Post-MVP, and Fallback
 
@@ -1152,7 +1216,8 @@ Mitigation:
 
 - 早期に Resend の送信テストを行う。
 - development では件名に `[DEV]` を付ける。
-- production では送信元ドメイン設定を確認する。
+- MVP では Resend のデフォルト送信元を許容する。
+- 本公開前または運用安定化の段階で、独自ドメイン認証による送信元設定を検討する。
 - 管理者通知の送信失敗時も D1 に緊急連絡データを保存し、管理画面から確認できるようにする。
 - ユーザー向け自動返信の送信失敗時はフォーム送信自体を成功扱いにし、管理画面で失敗状態を確認できるようにする。
 
@@ -1181,18 +1246,15 @@ Mitigation:
 - QR コード掲示物に短縮 URL を文字列として併記するか。
 - 公開時の最終ドメイン。
 
-### 16.2 Technical Open Items
+### 16.3 Tchnical Open Items
 
-- OpenNext for Cloudflare の具体設定。
-- D1 migration / seed の管理方法。
-- ピンチズーム・パン実装ライブラリを使うか自前実装するか。
-- 管理画面の UI コンポーネント構成。
-- レート制限の具体方式。
-- 管理者パスワードハッシュの生成手順。
-- Cloudflare 環境変数と D1 binding の命名。
-- Resend の送信元ドメイン設定。
+- OpenNext for Cloudflare の細かな設定値。
+- PBKDF2-SHA256 の iteration 数。
+- レート制限の初期閾値。
+- `react-zoom-pan-pinch` と相対座標ピン表示の実機検証結果。
+- Resend の独自ドメイン認証をいつ実施するか。
 
-### 16.3 Operational Open Items
+### 16.4 Operational Open Items
 
 - 公開後の給水機情報更新責任者。
 - 緊急連絡を受けた後の対応フロー。
