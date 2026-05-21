@@ -1,0 +1,1157 @@
+# Design Doc: キャリボト Web マッププロジェクト
+
+## Index
+
+- [0. Document Status](#0-document-status)
+- [1. Overview and Goals](#1-overview-and-goals)
+- [2. Architecture](#2-architecture)
+- [3. Routing and User Flows](#3-routing-and-user-flows)
+- [4. Data Model](#4-data-model)
+- [5. Map Image and Pin Coordinate Design](#5-map-image-and-pin-coordinate-design)
+- [6. Water Station Features](#6-water-station-features)
+- [7. Installation Request and Voting](#7-installation-request-and-voting)
+- [8. Emergency Contact](#8-emergency-contact)
+- [9. Admin Console and Authentication](#9-admin-console-and-authentication)
+- [10. Landing Page](#10-landing-page)
+- [11. QR Code and Short Link Operations](#11-qr-code-and-short-link-operations)
+- [12. Analytics and Privacy](#12-analytics-and-privacy)
+- [13. Deployment and Environments](#13-deployment-and-environments)
+- [14. MVP Scope, Post-MVP, and Fallback](#14-mvp-scope-post-mvp-and-fallback)
+- [15. Risks and Mitigations](#15-risks-and-mitigations)
+- [16. Open Items](#16-open-items)
+- [17. Implementation Notes](#17-implementation-notes)
+
+## 0. Document Status
+
+本書は `PRD.md` をもとに、給水機マップ Web アプリおよびキャリボト LP サイトの実装方針を整理する Design Doc である。
+
+初回リリースは 2026 年 6 月中旬を目標とする。MVP ではユーザー向け体験を優先しつつ、管理者が給水機情報・設置希望・緊急連絡を最低限運用できる状態を目指す。
+
+本書では、壁打ちで決定済みの事項を「Decision」として扱い、MVP 後に回す事項や未確定事項は明示的に分ける。
+
+## 1. Overview and Goals
+
+### 1.1 Product Scope
+
+本プロダクトは、阪大内の給水機の場所・稼働状態・水温種別を確認できる Web アプリと、キャリボトの活動を紹介する LP サイトで構成する。
+
+MVP では以下を同一アプリケーション内に実装する。
+
+- キャリボト LP サイト
+- 給水機マップ
+- 給水機詳細
+- 設置希望・投票
+- 緊急連絡フォーム
+- 管理画面
+- QR コード経由アクセス
+- 最小限の分析イベント保存
+
+### 1.2 Goals
+
+- 豊中・吹田・箕面キャンパスの給水機を地図画像上で確認できる。
+- 給水機ごとに利用可能状態と水温種別を表示できる。
+- ユーザーが給水機設置希望を建物単位で投稿・投票できる。
+- ユーザーが給水機の故障・停止・異常を緊急連絡できる。
+- 管理者が給水機情報、設置希望、緊急連絡を管理できる。
+- 給水機ごとの QR コードから該当給水機詳細へ遷移できる。
+- LP サイトからキャリボト活動の概要と給水機マップへの導線を提供できる。
+- 2027 年度以降のマイハンダイ掲載に向けた利用実績・運用実績を残せる。
+
+### 1.3 Non-Goals for MVP
+
+- 地図 SDK の導入。
+- Google Maps API、Mapbox、OpenStreetMap などによる本格的な地図実装。
+- 現在地ピンの表示。
+- 最寄り給水機の自動算出。
+- ルート案内。
+- 音声案内。
+- 給水量の自動取得。
+- IoT / マイコン連携。
+- 個別管理者アカウント。
+- 管理画面の詳細な監査ログ。
+- 緊急連絡フォームの写真添付。
+- ユーザーへの自動返信メール。
+- QR コードの自動発行・一括管理。
+
+## 2. Architecture
+
+### 2.1 High-Level Architecture
+
+Decision:
+
+- アプリケーションは Next.js フルスタック構成とする。
+- ホスティングと実行基盤は Cloudflare を前提とする。
+- Next.js を Cloudflare で動かす方式は OpenNext for Cloudflare を第一候補とする。
+- DB は Cloudflare D1 を使用する。
+- メール送信は Resend を使用する。
+- 短縮リンクは `url.gdgs.jp` を使用する。
+- 分析は Cloudflare 中心の最小構成とし、必要なイベントはアプリ側で D1 に保存する。
+
+```mermaid
+flowchart TD
+  User["User Browser"] --> App["Next.js App on Cloudflare"]
+  Admin["Cariboto Admin"] --> App
+  QR["Per-Station QR Code"] --> ShortLink["url.gdgs.jp"]
+  ShortLink --> App
+  App --> D1["Cloudflare D1"]
+  App --> Resend["Resend"]
+  App --> StaticAssets["Static Map Assets"]
+  App --> Analytics["Cloudflare Analytics"]
+  Resend --> Mailbox["carry.my.bottle@gmail.com"]
+```
+
+### 2.2 Application Responsibilities
+
+Next.js アプリは以下を担当する。
+
+- LP 表示
+- 給水機マップ表示
+- 給水機詳細表示
+- 設置希望投稿・投票
+- 緊急連絡フォーム
+- 管理画面
+- API / Server Actions / Route Handlers
+- D1 への読み書き
+- Resend 経由の管理者通知
+- セッション Cookie の発行・検証
+- QR 経由イベントの保存
+
+### 2.3 Cloudflare Runtime Constraints
+
+Cloudflare 上で Next.js を動かすため、以下を前提とする。
+
+- Node.js のファイルシステム書き込みに依存しない。
+- 長時間実行処理を避ける。
+- 画像アップロードやファイル保存は MVP では扱わない。
+- 地図画像などの静的アセットはビルド成果物または Cloudflare 側で配信する。
+- Next.js の画像最適化機能に強く依存しない。
+- Cloudflare Workers 環境で利用可能な Web API を中心に実装する。
+
+## 3. Routing and User Flows
+
+### 3.1 Routes
+
+Decision:
+
+- `/` は LP サイトとする。
+- `/map` は給水機マップとする。
+- `/stations/[stationId]` は給水機詳細とする。
+- `/requests` は設置希望・投票画面とする。
+- `/contact/[stationId]` は給水機に紐づく緊急連絡フォームとする。
+- `/admin/login` は管理画面ログインとする。
+- `/admin` は管理画面トップとする。
+- `/admin/stations` は給水機管理とする。
+- `/admin/requests` は設置希望管理とする。
+- `/admin/contacts` は緊急連絡管理とする。
+
+### 3.2 Main User Flow: LP to Map
+
+- ユーザーが `/` にアクセスする。
+- キャリボトの活動概要、給水機プロジェクトの背景、マイボトル利用促進の目的を確認する。
+- CTA から `/map` に遷移する。
+- キャンパスを選択し、給水機の位置と状態を確認する。
+
+### 3.3 Main User Flow: Find a Water Station
+
+- ユーザーが `/map` にアクセスする。
+- キャンパスを選択する。
+- キャンパスごとの地図画像が表示される。
+- 地図上に相対座標で給水機ピンが表示される。
+- ユーザーはピンチズーム・パンで地図を拡大・移動できる。
+- ユーザーがピンを選択する。
+- 給水機詳細または詳細パネルを表示する。
+
+### 3.4 Main User Flow: QR Code
+
+- ユーザーが給水機に掲示された QR コードを読み取る。
+- QR コードは `url.gdgs.jp` の短縮リンクに遷移する。
+- 短縮リンクは `/stations/[stationId]?source=qr&station_id=[stationId]` に遷移する。
+- アプリは QR 経由アクセスとしてイベントを保存する。
+- ユーザーは該当給水機の詳細を確認する。
+
+### 3.5 Main User Flow: Installation Request
+
+- ユーザーが `/requests` にアクセスする。
+- キャンパスを選択する。
+- 建物単位のリクエスト状況を確認する。
+- ユーザーは建物に対して投票する。
+- 必要に応じてコメントを入力する。
+- コメントは公開側には表示せず、管理者向け情報として保存する。
+- 同じブラウザから同じ建物への再投票は 7 日のクールダウンを設ける。
+
+### 3.6 Main User Flow: Emergency Contact
+
+- ユーザーが給水機詳細から緊急連絡フォームを開く。
+- issue type、内容、連絡者メールアドレスを入力する。
+- フォームを送信する。
+- アプリは D1 に緊急連絡を保存する。
+- Resend 経由で `carry.my.bottle@gmail.com` に通知する。
+- MVP ではユーザーへの自動返信は送らず、画面上に送信完了を表示する。
+
+## 4. Data Model
+
+### 4.1 Data Modeling Principles
+
+Decision:
+
+- D1 を主データストアとする。
+- 建物一覧は D1 に seed する。
+- MVP では建物一覧の管理画面編集は対象外とする。
+- 給水機の水温種別は JSON 配列で保持する。
+- 給水機の状態は 1 つの status として保持する。
+- 給水機ピン座標はキャンパスごとの地図画像に対する相対座標で保持する。
+
+ID は実装と運用で読みやすい文字列 ID を基本とする。給水機は `station_001` のような安定 ID を使い、QR コードや短縮リンクの対応表から参照されても変更しない。
+
+時刻は UTC で保存し、表示時に必要に応じて日本時間へ変換する。
+
+削除は、ユーザー投稿や緊急連絡のように運用上復元・確認が必要になり得るデータでは `deleted_at` による論理削除を基本とする。給水機マスタは MVP では物理削除も許容するが、QR コードと紐づいた給水機は `is_public = 0` による非公開化を優先する。
+
+### 4.2 campuses
+
+キャンパス情報を保持する。
+
+- `id`: text, primary key。例: `toyonaka`, `suita`, `minoh`
+- `name`: text。表示名。
+- `map_image_path`: text。地図画像のパス。
+- `map_width`: integer, nullable。元画像幅。必要に応じて保持する。
+- `map_height`: integer, nullable。元画像高。必要に応じて保持する。
+- `created_at`: datetime
+- `updated_at`: datetime
+
+### 4.3 buildings
+
+建物一覧を保持する。MVP では seed データとして管理する。
+
+- `id`: text, primary key
+- `campus_id`: text
+- `name`: text。例: `U2棟`
+- `sort_order`: integer
+- `created_at`: datetime
+- `updated_at`: datetime
+
+推奨制約:
+
+- `campus_id`, `name` の組み合わせは一意にする。
+- `campus_id`, `sort_order` にインデックスを貼る。
+
+### 4.4 stations
+
+給水機情報を保持する。
+
+- `id`: text, primary key
+- `campus_id`: text
+- `building_id`: text
+- `name`: text
+- `description`: text, nullable
+- `relative_x`: real。地図画像上の X 相対座標。0.0 から 1.0。
+- `relative_y`: real。地図画像上の Y 相対座標。0.0 から 1.0。
+- `status`: text。`available`, `stopped`, `broken`
+- `temperature_types`: text。JSON 配列。例: `["cold","normal"]`
+- `short_link_id`: text, nullable。`url.gdgs.jp` 側の短縮リンク識別子。
+- `short_link_url`: text, nullable。
+- `is_public`: integer。公開対象かどうか。
+- `created_at`: datetime
+- `updated_at`: datetime
+
+MVP の必須項目は、キャンパス、建物、名称、相対座標、状態、水温、説明とする。短縮リンク関連は個別 QR 運用のため任意項目として持つ。
+
+推奨制約:
+
+- `relative_x` と `relative_y` は 0.0 以上 1.0 以下に制限する。
+- `status` は `available`, `stopped`, `broken` のいずれかに制限する。
+- `campus_id`, `building_id` にインデックスを貼る。
+- `short_link_url` は登録される場合、一意にする。
+
+### 4.5 installation_targets
+
+設置希望の建物単位集約を表す。建物ごとに 1 件を基本とする。
+
+- `id`: text, primary key
+- `campus_id`: text
+- `building_id`: text
+- `vote_count`: integer
+- `created_at`: datetime
+- `updated_at`: datetime
+
+建物ごとの集約を採用することで、似た投稿が乱立することを避ける。
+
+推奨制約:
+
+- `campus_id`, `building_id` の組み合わせは一意にする。
+- `vote_count` は `installation_votes` から再集計可能だが、MVP では一覧表示を軽くするためキャッシュ値として保持する。
+
+### 4.6 installation_votes
+
+投票履歴を保持する。
+
+- `id`: text, primary key
+- `target_id`: text
+- `voter_token_hash`: text。Cookie に保存した識別子をハッシュ化した値。
+- `created_at`: datetime
+
+同じ `target_id` と同じ `voter_token_hash` の組み合わせについて、直近 7 日以内の再投票を拒否する。
+
+Cookie の生値は DB に保存しない。DB にはハッシュ化した識別子のみを保存する。
+
+推奨インデックス:
+
+- `target_id`, `created_at`
+- `target_id`, `voter_token_hash`, `created_at`
+
+### 4.7 installation_comments
+
+設置希望に紐づく管理者向けコメントを保持する。
+
+- `id`: text, primary key
+- `target_id`: text
+- `comment`: text
+- `created_at`: datetime
+- `deleted_at`: datetime, nullable
+
+MVP ではコメントを一般公開しない。公開側にはキャンパス、建物、投票数を中心に表示する。
+
+推奨インデックス:
+
+- `target_id`, `created_at`
+- `deleted_at`
+
+### 4.8 emergency_contacts
+
+緊急連絡を保持する。
+
+- `id`: text, primary key
+- `station_id`: text
+- `issue_type`: text。`broken`, `stopped`, `no_water`, `leak_or_abnormal`, `other`
+- `message`: text
+- `reporter_email`: text
+- `email_sent_at`: datetime, nullable
+- `created_at`: datetime
+- `deleted_at`: datetime, nullable
+
+MVP では写真添付を扱わない。
+
+推奨インデックス:
+
+- `station_id`, `created_at`
+- `created_at`
+- `deleted_at`
+
+### 4.9 analytics_events
+
+必要最小限のイベントを保存する。
+
+- `id`: text, primary key
+- `event_name`: text
+- `station_id`: text, nullable
+- `campus_id`: text, nullable
+- `building_id`: text, nullable
+- `source`: text, nullable
+- `metadata_json`: text, nullable
+- `environment`: text。`production` または `development`
+- `created_at`: datetime
+
+MVP で優先して保存するイベントは以下とする。
+
+- `app_opened`
+- `map_viewed`
+- `water_station_detail_viewed`
+- `installation_request_voted`
+- `installation_request_commented`
+- `emergency_form_submitted`
+- `qr_code_scanned`
+
+推奨インデックス:
+
+- `event_name`, `created_at`
+- `station_id`, `created_at`
+- `environment`, `created_at`
+
+### 4.10 admin_audit_events
+
+MVP では詳細な監査ログは対象外だが、基本ログだけは軽く残せる構成にする。
+
+- `id`: text, primary key
+- `action`: text
+- `target_type`: text
+- `target_id`: text
+- `created_at`: datetime
+
+共有パスワード方式では個人を識別できないため、詳細な操作監査は個別アカウント移行後に強化する。
+
+## 5. Map Image and Pin Coordinate Design
+
+### 5.1 Map Asset Strategy
+
+Decision:
+
+- キャンパスごとに別の静的地図画像を用意する。
+- 阪大公式キャンパスマップを参考に生成した独自画像を使用する。
+- MVP では生成済み画像を静的アセットとして扱う。
+- 地図画像はキャンパスごとに別座標系を持つ。
+
+地図画像の候補配置は以下とする。
+
+- `public/maps/toyonaka.png`
+- `public/maps/suita.png`
+- `public/maps/minoh.png`
+
+実際のファイル名は実装時に統一する。
+
+### 5.2 Relative Coordinates
+
+給水機ピンは地図画像上の相対座標で管理する。
+
+- 左端を `x = 0.0`
+- 右端を `x = 1.0`
+- 上端を `y = 0.0`
+- 下端を `y = 1.0`
+
+表示時は画像コンテナの表示サイズに対して `left: relative_x * 100%`、`top: relative_y * 100%` のように配置する。
+
+この方式により、スマートフォン幅に合わせて画像が縮小・拡大されてもピン位置を維持しやすい。
+
+### 5.3 Pinch Zoom and Pan
+
+Decision:
+
+- MVP でピンチズーム・パンに対応する。
+- 地図画像とピンを同じ変換コンテナ内に置く。
+- 拡大・移動しても画像とピンの相対位置がずれないようにする。
+
+実装方針:
+
+- 地図全体を `MapViewport` と `MapCanvas` に分ける。
+- `MapCanvas` に対して scale と translate を適用する。
+- 画像とピンは `MapCanvas` の子要素として配置する。
+- タッチ操作とマウス操作の両方に対応する。
+- MVP では過度な慣性スクロールや高度なアニメーションは不要とする。
+
+Fallback:
+
+- ピンチズーム・パン実装が遅延する場合でも、地図画像とピン表示は維持する。
+- その場合はキャンパス選択・建物フィルタ・詳細リストで探索性を補う。
+
+### 5.4 Current Location
+
+Decision:
+
+- 現在地ピンは MVP 対象外とする。
+- GPS で取得した現在地を地図画像上に正確にマッピングする機能は MVP では実装しない。
+
+理由:
+
+- 地図画像と緯度経度の対応付けが必要になる。
+- キャンパス内や屋内では GPS 精度が不足しやすい。
+- 「Google マップのような現在地」を期待させると実装難度と UX リスクが大きい。
+
+MVP では、キャンパス選択、建物名、給水機リスト、地図上ピンにより位置把握を補助する。
+
+## 6. Water Station Features
+
+### 6.1 Station Status
+
+Decision:
+
+- 給水機の状態は 1 つの status として扱う。
+- MVP の状態は `available`, `stopped`, `broken` の 3 種類とする。
+
+表示名:
+
+- `available`: 利用可能
+- `stopped`: 停止中
+- `broken`: 故障中
+
+### 6.2 Temperature Types
+
+Decision:
+
+- 水温種別は複数選択可能とする。
+- DB では JSON 配列として保持する。
+
+表示名:
+
+- `cold`: 冷水
+- `normal`: 常温水
+- `hot`: 温水
+
+MVP では水温ごとの個別状態は持たない。例えば「冷水は利用可能だが温水だけ停止中」のような表現が必要になった場合は、MVP 後に `station_temperature_statuses` のような正規化テーブルを検討する。
+
+### 6.3 Station Detail
+
+給水機詳細では以下を表示する。
+
+- 給水機名
+- キャンパス
+- 建物
+- 説明
+- 利用可能状態
+- 水温種別
+- 緊急連絡フォームへの導線
+- 設置希望画面への導線
+
+QR コード経由で開かれた場合も同じ詳細画面を表示する。
+
+## 7. Installation Request and Voting
+
+### 7.1 Request Granularity
+
+Decision:
+
+- 設置希望は建物ごとに集約する。
+- ユーザーは建物に対して投票する。
+- コメントは建物単位の設置希望に紐づける。
+- コメントは MVP では一般公開せず、管理者向けに保存する。
+
+この方式により、同じ建物に対する設置希望が複数件に分散することを避ける。
+
+### 7.2 Voting Policy
+
+Decision:
+
+- ログインなしで投票できる。
+- Cookie ベースで簡易的に同一ブラウザを識別する。
+- 同じ建物への再投票は 7 日後に可能とする。
+- サーバー側でも直近 7 日以内の重複投票を拒否する。
+
+Cookie の識別子はランダム値とし、DB にはハッシュ化した値のみ保存する。
+
+### 7.3 Abuse Prevention
+
+MVP で行う対策:
+
+- Cookie による簡易制限。
+- サーバー側で 7 日クールダウンを検証。
+- IP またはリクエスト頻度に基づく簡易レート制限。
+- 管理画面から不自然なコメントや投稿を削除可能にする。
+
+MVP では完全な不正投票防止は目指さない。Google ログイン、メール認証、IP 制限、Turnstile などは、利用状況を見て MVP 後に検討する。
+
+### 7.4 Public Request List
+
+公開側では以下を表示する。
+
+- キャンパス
+- 建物名
+- 投票数
+
+コメント本文は公開しない。コメント数の公開は MVP 実装時に判断してよいが、不適切コメントの露出リスクを避けるため、本文公開は行わない。
+
+## 8. Emergency Contact
+
+### 8.1 MVP Fields
+
+Decision:
+
+- MVP では写真添付を扱わない。
+- 入力項目は給水機、issue type、内容、連絡者メールアドレスとする。
+- ユーザーへの自動返信メールは MVP 対象外とする。
+- 送信完了は画面上で表示する。
+
+issue type は以下とする。
+
+- `broken`: 故障
+- `stopped`: 停止中
+- `no_water`: 水が出ない
+- `leak_or_abnormal`: 水漏れ・異常
+- `other`: その他
+
+### 8.2 Notification
+
+緊急連絡フォーム送信時の処理:
+
+- 入力内容を検証する。
+- D1 の `emergency_contacts` に保存する。
+- Resend 経由で `carry.my.bottle@gmail.com` に通知する。
+- 通知メールには、給水機名、キャンパス、建物、issue type、本文、連絡者メールアドレス、管理画面 URL を含める。
+- 送信成功後、画面に完了メッセージを表示する。
+
+Resend の API key は Cloudflare の環境変数で管理する。
+
+### 8.3 Spam Prevention
+
+MVP ではサーバー側レート制限を行う。Cloudflare Turnstile や CAPTCHA は MVP では必須にしない。
+
+Fallback:
+
+- スパムが発生した場合は Cloudflare Turnstile を追加する。
+- 緊急連絡が悪用される場合は、連絡者メールの検証や一時的な送信制限を検討する。
+
+## 9. Admin Console and Authentication
+
+### 9.1 Admin Scope
+
+Decision:
+
+- MVP で管理画面を提供する。
+- 給水機管理、設置希望管理、緊急連絡管理を対象とする。
+- 給水機のビジュアル座標エディタを MVP に含める。
+
+管理画面で可能にする操作:
+
+- 給水機の追加・編集・削除。
+- 給水機の状態更新。
+- 給水機の水温種別更新。
+- 給水機の説明更新。
+- 地図上クリックによる相対座標設定。
+- 設置希望の閲覧。
+- 設置希望コメントの閲覧・削除。
+- 緊急連絡の閲覧・削除。
+- station_id と短縮リンク URL の対応管理。
+
+ビジュアル座標エディタの MVP 境界:
+
+- 地図上をクリックして座標を設定できる。
+- ピンのドラッグ調整は MVP では必須にしない。
+- 高度なスナップ、履歴、プレビュー比較は MVP 後とする。
+
+### 9.2 Authentication
+
+Decision:
+
+- MVP では共有管理者パスワード方式を採用する。
+- 環境変数に平文パスワードを保存しない。
+- 環境変数には `salt + hash` 済みの値を保存する。
+- ログイン成功時に署名付きセッション Cookie を発行する。
+- この方式は MVP 限定とし、将来的に `accounts.gdgs.jp` または個別アカウント方式へ移行する。
+
+環境変数:
+
+- `ADMIN_PASSWORD_HASH`
+- `ADMIN_PASSWORD_SALT`
+- `SESSION_SECRET`
+
+ログインフロー:
+
+- 管理者が `/admin/login` を開く。
+- パスワードを入力する。
+- サーバー側で入力パスワードに salt を適用し、ハッシュ化する。
+- `ADMIN_PASSWORD_HASH` と定数時間比較する。
+- 一致した場合、署名付きセッション Cookie を発行する。
+- `/admin` 配下では Cookie を検証してログイン状態を確認する。
+- ログアウト時は Cookie を削除する。
+
+Cookie 属性:
+
+- `HttpOnly`
+- `Secure`
+- `SameSite=Lax` または `SameSite=Strict`
+- 適切な有効期限
+
+### 9.3 Security Limitations
+
+共有パスワード方式の制約:
+
+- 誰が操作したかを個人単位では追跡できない。
+- 退任者が出た場合はパスワード変更が必要。
+- 権限分離ができない。
+- 詳細な監査ログには向かない。
+
+MVP 後の改善候補:
+
+- `accounts.gdgs.jp` 連携。
+- 個別管理者アカウント。
+- 操作ログの詳細化。
+- ロールベースアクセス制御。
+
+## 10. Landing Page
+
+### 10.1 Route and Role
+
+Decision:
+
+- LP は同一 Next.js アプリ内の `/` に配置する。
+- 給水機マップは `/map` に配置する。
+- LP はキャリボトの活動理解と給水機マップへの導線を担う。
+
+### 10.2 MVP Content
+
+MVP の LP に含める内容:
+
+- キャリボトの活動概要。
+- 給水機プロジェクトの背景。
+- マイボトル利用促進の目的。
+- 給水機マップへの CTA。
+- 問い合わせリンクまたはメールリンク。
+
+MVP ではニュース、FAQ、活動実績の詳細、マイボトル販売情報、SNS 共有最適化は必須にしない。
+
+### 10.3 Content Ownership
+
+Decision:
+
+- GDG が LP 文言の仮案を作成する。
+- キャリボトが内容を確認・承認する。
+- ロゴ、画像、活動写真などの素材はキャリボト提供または承認済み素材を使用する。
+
+素材が揃わない場合は、写真なしの最小構成で公開し、後から差し替える。
+
+## 11. QR Code and Short Link Operations
+
+### 11.1 QR Scope
+
+Decision:
+
+- MVP では給水機ごとの個別 QR コードを採用する。
+- 各 QR コードは `url.gdgs.jp` の短縮リンクを指す。
+- 短縮リンクの遷移先は該当給水機詳細とする。
+
+例:
+
+```text
+QR Code
+  -> https://url.gdgs.jp/xxxxx
+  -> https://example.com/stations/station_001?source=qr&station_id=station_001
+```
+
+### 11.2 Short Link Management
+
+Decision:
+
+- MVP では短縮リンクを手動発行する。
+- `station_id` と短縮リンクの対応表を D1 / 管理画面で管理する。
+- 管理画面から station ごとに `short_link_id` と `short_link_url` を確認・編集できるようにする。
+
+運用フロー:
+
+- 給水機データを作成する。
+- station_id を確定する。
+- `url.gdgs.jp` で短縮リンクを作成する。
+- 遷移先 URL に `source=qr&station_id=...` を付与する。
+- 作成した短縮リンクを管理画面に登録する。
+- QR コードを生成し、給水機に掲示する。
+
+MVP では QR コード自動生成・短縮リンク自動発行は行わない。
+
+### 11.3 QR Tracking
+
+Decision:
+
+- QR 経由アクセスはアプリ側でイベント保存する。
+- 短縮リンク先 URL に `source=qr&station_id=...` を付ける。
+- アプリはアクセス時に `qr_code_scanned` 相当のイベントを保存する。
+
+`url.gdgs.jp` 側のクリックログが利用できる場合は補助的に参照するが、MVP の必須計測はアプリ側で行う。
+
+### 11.4 Operational Risks
+
+リスク:
+
+- station_id と QR コードの貼り間違い。
+- 短縮リンクのリンク先設定ミス。
+- QR コード掲示物の剥がれ・汚れ。
+- 短縮リンク管理権限が不明確になる。
+
+対策:
+
+- QR 発行時に station_id、建物名、短縮リンク URL の確認リストを作る。
+- 掲示前に実機で読み取り確認する。
+- 短縮リンク管理者を明確にする。
+- QR 掲示物には必要に応じて短縮 URL の文字列も併記する。
+
+## 12. Analytics and Privacy
+
+### 12.1 Analytics Policy
+
+Decision:
+
+- Cloudflare 中心の最小分析構成とする。
+- 個人を直接識別する分析は行わない。
+- QR や主要操作は必要最小限のイベントとして D1 に保存する。
+
+MVP で追跡したい指標:
+
+- アクセス数。
+- 給水機詳細閲覧数。
+- 設置希望投票数。
+- 緊急連絡送信数。
+- QR コード経由アクセス数。
+
+### 12.2 Privacy Policy
+
+MVP で扱う個人情報・準個人情報:
+
+- 緊急連絡の連絡者メールアドレス。
+- 緊急連絡本文。
+- 投票制限用 Cookie。
+- QR / イベントログ。
+
+Decision:
+
+- 現在地情報は MVP では扱わない。
+- 不要な位置情報保存は行わない。
+- 投票 Cookie は重複投票制限にのみ使う。
+- Cookie の生値は DB に保存しない。
+- 分析イベントには個人識別情報を含めない。
+- 緊急連絡データは 90 日を目安に削除対象とする。
+
+### 12.3 User Notice
+
+MVP では Cookie 同意バナーは必須にしない。代わりに、フッターまたはプライバシー説明ページで以下を通知する。
+
+- 投票制限のため Cookie を使用すること。
+- アクセス状況改善のため最小限のイベントを保存すること。
+- 緊急連絡で入力されたメールアドレスと本文は管理者確認のため保存されること。
+- 緊急連絡データは 90 日を目安に削除対象となること。
+
+法務・大学側から明示同意が必要と判断された場合は、Cookie 同意 UI を追加する。
+
+## 13. Deployment and Environments
+
+### 13.1 Branch and Environment Policy
+
+Decision:
+
+- `main` は production 環境へデプロイする。
+- `develop` は development / preview 環境へデプロイする。
+- ローカル環境で実装確認できるようにする。
+- D1 は production と development で分離する。
+- その他の外部サービスやアセットは MVP では共通利用を許容する。
+
+環境:
+
+- local: 開発者のローカル環境。
+- development: `develop` ブランチのデプロイ先。
+- production: `main` ブランチのデプロイ先。
+
+### 13.2 Resource Separation
+
+分離するもの:
+
+- D1 database。
+- 本番用と開発用の環境変数。
+- 管理者パスワードハッシュ。
+
+MVP では共通利用を許容するもの:
+
+- Resend アカウント。
+- 地図画像アセット。
+- LP 用静的素材。
+
+Resend を共通利用する場合、開発環境から送るメール件名には `[DEV]` を付ける。イベント保存時も `environment` を保存し、本番データと開発データを混同しない。
+
+### 13.3 Domain
+
+Decision:
+
+- MVP 初期は Cloudflare のサブドメインで確認できる状態にする。
+- 公開時に GDG 管理のカスタムドメイン利用を検討する。
+- QR コードのリンク先は直接 URL ではなく `url.gdgs.jp` の短縮リンクを使うため、アプリ本体のドメイン変更には対応しやすい。
+
+### 13.4 Environment Variables
+
+想定する環境変数:
+
+- `APP_ENV`
+- `APP_BASE_URL`
+- `ADMIN_PASSWORD_HASH`
+- `ADMIN_PASSWORD_SALT`
+- `SESSION_SECRET`
+- `RESEND_API_KEY`
+- `EMERGENCY_CONTACT_TO`
+- `VOTE_TOKEN_SECRET`
+
+D1 binding 名や Cloudflare 固有設定は実装時の `wrangler` / OpenNext 設定に合わせて決定する。
+
+## 14. MVP Scope, Post-MVP, and Fallback
+
+### 14.1 MVP Must-Haves
+
+Decision:
+
+MVP では、ここまで合意した広めの範囲を必須として扱う。
+
+- Next.js + Cloudflare + D1 の基本構成。
+- `/` の LP。
+- `/map` の給水機マップ。
+- キャンパスごとの地図画像。
+- 相対座標による給水機ピン表示。
+- ピンチズーム・パン。
+- 給水機詳細。
+- 給水機状態表示。
+- 水温種別表示。
+- 設置希望の建物別集約。
+- ログインなし投票。
+- 7 日クールダウン。
+- 管理者向けコメント保存。
+- 緊急連絡フォーム。
+- Resend による管理者通知。
+- 管理画面。
+- 共有パスワードハッシュ + セッション Cookie 認証。
+- ビジュアル座標エディタ。
+- 個別 QR コード。
+- `url.gdgs.jp` 短縮リンク。
+- QR 経由イベント保存。
+- 最小限のプライバシー説明。
+
+MVP の完了条件:
+
+- スマートフォンで LP、マップ、給水機詳細、設置希望、緊急連絡が操作できる。
+- 管理者がログインし、給水機情報と座標を更新できる。
+- 管理者が設置希望コメントと緊急連絡を確認できる。
+- 個別 QR のリンク先から該当給水機詳細が開ける。
+- production と development の D1 が分離されている。
+- 本番データを development から誤って更新しない構成になっている。
+- 緊急連絡メールが管理者宛に届く。
+- 主要な残リスクが README または運用メモではなく、本 Design Doc 上で確認できる。
+
+### 14.2 MVP Fallback
+
+6 月中旬に間に合わない場合は、ユーザー向け体験を優先する。
+
+優先して残すもの:
+
+- LP。
+- 給水機マップ。
+- 給水機ピン表示。
+- 給水機詳細。
+- QR から該当給水機詳細への導線。
+- 緊急連絡フォーム。
+
+削減候補:
+
+- 管理画面の高度な機能。
+- ビジュアル座標エディタのドラッグ調整。
+- 管理画面からの給水機追加・削除。
+- 短縮リンク対応表の管理 UI。
+- 詳細な分析イベント。
+
+Fallback 方針:
+
+- 管理画面が遅延した場合、給水機データや座標は seed / DB 直接登録で運用する。
+- ユーザー向け表示と QR 導線を優先する。
+- 管理画面は状態更新と緊急連絡確認に絞る。
+
+削ってはいけないもの:
+
+- 給水機の場所表示。
+- 給水機詳細。
+- QR から給水機詳細への到達。
+- 緊急連絡の送信導線。
+
+延期してよいもの:
+
+- 管理画面の見た目の作り込み。
+- 座標エディタのドラッグ操作。
+- 詳細なイベント分析。
+- LP の追加コンテンツ。
+- QR 発行作業の自動化。
+
+### 14.3 Post-MVP Candidates
+
+- 現在地ピン表示。
+- GPS によるキャンパス推定。
+- 最寄り給水機の自動算出。
+- ルート案内。
+- 地図 SDK 導入検討。
+- 緊急連絡フォームの写真添付。
+- ユーザーへの自動返信メール。
+- Cloudflare Turnstile。
+- 投稿・投票の認証強化。
+- 個別管理者アカウント。
+- `accounts.gdgs.jp` 連携。
+- 詳細な監査ログ。
+- QR コード自動生成。
+- 短縮リンク自動発行。
+- QR 掲示物の定期点検フロー。
+- LP の FAQ、ニュース、活動実績、OGP 対応。
+- マイハンダイ掲載対応。
+
+## 15. Risks and Mitigations
+
+### 15.1 MVP Scope Risk
+
+Risk:
+
+MVP に LP、マップ、投票、緊急連絡、管理画面、QR、ピンチズーム・パンまで含めるため、6 月中旬に対してスコープが広い。
+
+Mitigation:
+
+- ユーザー向け体験を最優先する。
+- 管理画面の一部は seed / DB 直接運用にフォールバックできるようにする。
+- ビジュアル座標エディタはクリック設定を最小ラインにする。
+- 高度な分析や自動化は MVP 後に回す。
+
+### 15.2 Map Rights Risk
+
+Risk:
+
+阪大公式キャンパスマップを参考に生成した画像の権利・利用条件に懸念が残る。
+
+Decision:
+
+MVP では生成した独自画像として利用する前提とする。
+
+Mitigation:
+
+- 公式地図をそのまま転載しない。
+- 必要に応じて簡略化した独自図に差し替えられるようにする。
+- 公開範囲が広がる段階で利用条件を再確認する。
+
+### 15.3 Authentication Risk
+
+Risk:
+
+共有管理者パスワード方式では、個人別の追跡や権限分離ができない。
+
+Mitigation:
+
+- 環境変数に平文パスワードを保存しない。
+- `salt + hash` と定数時間比較を使う。
+- セッション Cookie は `HttpOnly`, `Secure`, `SameSite` を設定する。
+- MVP 後に個別アカウントまたは `accounts.gdgs.jp` へ移行する。
+
+### 15.4 Spam and Abuse Risk
+
+Risk:
+
+投票、コメント、緊急連絡がスパムや不正利用される可能性がある。
+
+Mitigation:
+
+- 投票は Cookie とサーバー側クールダウンで制限する。
+- コメントは一般公開しない。
+- 緊急連絡はレート制限する。
+- 問題が出た場合は Cloudflare Turnstile を追加する。
+- 管理画面で削除できるようにする。
+
+### 15.5 QR Operation Risk
+
+Risk:
+
+個別 QR コードでは、station_id と掲示場所の対応ミスが起こりやすい。
+
+Mitigation:
+
+- 発行リストを作る。
+- 掲示前に実機で読み取り確認する。
+- 管理画面で station_id と短縮リンク URL を確認できるようにする。
+- 短縮リンクによりリンク先変更に対応できるようにする。
+
+### 15.6 Privacy Risk
+
+Risk:
+
+緊急連絡のメールアドレスや本文、投票 Cookie、イベントログを扱うため、プライバシー説明が不足すると問題になる。
+
+Mitigation:
+
+- 現在地情報は MVP で扱わない。
+- Cookie とイベント利用を説明する。
+- 緊急連絡データは 90 日を目安に削除対象とする。
+- 分析イベントに個人識別情報を入れない。
+
+### 15.7 Cloudflare Runtime Risk
+
+Risk:
+
+Next.js の一部機能が Cloudflare 実行環境でそのまま動かない可能性がある。
+
+Mitigation:
+
+- OpenNext for Cloudflare 前提で早期に技術検証する。
+- Node.js 固有 API やファイル書き込みを避ける。
+- 画像最適化に強く依存しない。
+- D1、Cookie、Resend 連携を早期にスパイクする。
+
+### 15.8 Initial Data Risk
+
+Risk:
+
+初期登録する給水機の台数、正確な場所、水温種別、状態が確定しない場合、マップとしての価値が下がる。
+
+Mitigation:
+
+- キャリボトから初期給水機一覧を最優先で受け取る。
+- 不明な給水機は MVP では表示しない。
+- 後から管理画面または seed 更新で追加できるようにする。
+- 初期データには「確認済み」かどうかを運用メモで残す。
+
+### 15.9 Email Deliverability Risk
+
+Risk:
+
+Resend から `carry.my.bottle@gmail.com` への通知が迷惑メール扱いになったり、送信元ドメイン設定が未完了で送信できない可能性がある。
+
+Mitigation:
+
+- 早期に Resend の送信テストを行う。
+- development では件名に `[DEV]` を付ける。
+- production では送信元ドメイン設定を確認する。
+- 送信失敗時も D1 に緊急連絡データを保存し、管理画面から確認できるようにする。
+
+### 15.10 Data Loss and Migration Risk
+
+Risk:
+
+D1 migration や seed 実行時に、本番の給水機・投票・緊急連絡データを誤って壊す可能性がある。
+
+Mitigation:
+
+- production と development の D1 を分離する。
+- seed は初期マスタ投入用とし、本番運用後の破壊的 seed を避ける。
+- migration は後方互換を意識し、既存データ削除を伴う変更を避ける。
+- 本番適用前に development で migration を検証する。
+
+## 16. Open Items
+
+### 16.1 Product Open Items
+
+- 初期登録する給水機の台数と場所一覧。
+- 各給水機の正確な建物・説明・水温種別。
+- LP に掲載する正式なキャリボト紹介文。
+- LP に掲載するロゴ、画像、活動写真。
+- QR コード掲示物の文言、サイズ、貼付位置。
+- QR コード掲示物に短縮 URL を文字列として併記するか。
+- 公開時の最終ドメイン。
+
+### 16.2 Technical Open Items
+
+- OpenNext for Cloudflare の具体設定。
+- D1 migration / seed の管理方法。
+- ピンチズーム・パン実装ライブラリを使うか自前実装するか。
+- 管理画面の UI コンポーネント構成。
+- レート制限の具体方式。
+- 管理者パスワードハッシュの生成手順。
+- Cloudflare 環境変数と D1 binding の命名。
+- Resend の送信元ドメイン設定。
+- `url.gdgs.jp` の短縮リンク作成・変更権限。
+
+### 16.3 Operational Open Items
+
+- 公開後の給水機情報更新責任者。
+- 緊急連絡を受けた後の対応フロー。
+- 設置希望コメントの確認頻度。
+- QR コード掲示物の点検頻度。
+- 短縮リンク変更時の承認フロー。
+- マイハンダイ掲載に必要な条件。
+
+## 17. Implementation Notes
+
+### 17.1 Suggested Initial Task Breakdown
+
+実装開始時は以下の順で進める。
+
+- Next.js + Cloudflare + D1 の最小構成を作る。
+- `campuses`, `buildings`, `stations` の migration と seed を作る。
+- `/map` で地図画像とピンを表示する。
+- 給水機詳細を表示する。
+- 管理画面ログインを実装する。
+- 管理画面で給水機を編集できるようにする。
+- ビジュアル座標エディタを追加する。
+- 設置希望・投票を実装する。
+- 緊急連絡フォームと Resend 通知を実装する。
+- LP を実装する。
+- QR 用 URL とイベント保存を実装する。
+- dev / production 環境を整備する。
+
+### 17.2 Early Technical Spikes
+
+早期に検証すべき項目:
+
+- OpenNext for Cloudflare で Route Handlers と D1 が問題なく動くか。
+- セッション Cookie の発行・検証が Cloudflare 上で安定するか。
+- Resend 送信が Cloudflare 環境から動くか。
+- ピンチズーム・パン時に画像とピンの位置がずれないか。
+- D1 の migration / seed / preview DB 分離が運用しやすいか。
+
