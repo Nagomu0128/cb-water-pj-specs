@@ -131,6 +131,119 @@ Cloudflare 上で Next.js を動かすため、以下を前提とする。
 - Next.js の画像最適化機能に強く依存しない。
 - Cloudflare Workers 環境で利用可能な Web API を中心に実装する。
 
+### 2.4 Application Architecture and Directory Structure
+
+Decision:
+
+- Next.js 16 App Router を前提にする。
+- アプリケーションコードは `src/` 配下にまとめる。
+- `src/app` は URL ルーティングと Next.js の特殊ファイルを置く薄い route adapter とする。
+- 実装本体は feature-based に整理し、`src/features/*` に置く。
+- 共通処理は `src/lib/*` に置く。
+- 汎用 UI は `src/components/*` に置く。
+- 入力検証は Zod に統一する。
+- DB アクセスは Drizzle ORM に統一する。
+- Drizzle schema と migrations は `src/lib/db` に集約する。
+- D1 binding から Drizzle client を生成する `getDb(d1: D1Database)` を `src/lib/db/client.ts` に用意する。
+- repository 層は厚く作らず、機能ごとの `queries.ts` で Drizzle query を実行する。
+- Server Actions は基本的に `src/features/*/actions.ts` に置く。
+
+想定ディレクトリ構成:
+
+```text
+src/
+  app/
+    page.tsx
+    map/page.tsx
+    stations/[stationId]/page.tsx
+    requests/page.tsx
+    contact/[stationId]/page.tsx
+    admin/
+      layout.tsx
+      page.tsx
+      login/page.tsx
+      stations/page.tsx
+      requests/page.tsx
+      contacts/page.tsx
+  features/
+    landing/
+      LandingPage.tsx
+    map/
+      MapPage.tsx
+      MapCanvas.tsx
+      actions.ts
+      queries.ts
+      schema.ts
+    stations/
+      StationDetailPage.tsx
+      actions.ts
+      queries.ts
+      schema.ts
+    requests/
+      RequestsPage.tsx
+      actions.ts
+      queries.ts
+      schema.ts
+    contact/
+      ContactPage.tsx
+      actions.ts
+      queries.ts
+      schema.ts
+    admin/
+      AdminDashboardPage.tsx
+      actions.ts
+      queries.ts
+      schema.ts
+  components/
+    ui/
+  lib/
+    db/
+      client.ts
+      schema.ts
+      types.ts
+      migrations/
+      seed.ts
+    auth/
+    mail/
+    rate-limit/
+    utils/
+```
+
+`src/app` の `page.tsx` は、該当する `features` の Page コンポーネントを呼び出す薄いファイルにする。
+
+例:
+
+```tsx
+import { MapPage } from "@/features/map/MapPage";
+
+export default function Page() {
+  return <MapPage />;
+}
+```
+
+動的ルートでは、Next.js 16 の async Request APIs を前提に `params` / `searchParams` を `await` してから feature 側へ渡す。
+
+```tsx
+import { StationDetailPage } from "@/features/stations/StationDetailPage";
+
+export default async function Page(props: PageProps<"/stations/[stationId]">) {
+  const { stationId } = await props.params;
+  return <StationDetailPage stationId={stationId} />;
+}
+```
+
+Next.js 16 前提の注意点:
+
+- `params` / `searchParams` は Promise として扱う。
+- `cookies()` / `headers()` などの Request APIs は async 前提で扱う。
+- `page.tsx`, `layout.tsx`, `loading.tsx`, `error.tsx`, `not-found.tsx`, `route.ts` は `src/app` 側に置く。
+- `features` 配下では `page.tsx` という特殊ファイル名を避け、`MapPage.tsx` のような明示的な名前にする。
+- route 固有の小さな実装詳細を `src/app` 側に置く場合は、`_components` や `_actions` のような private folder を使ってルーティング対象外であることを明示する。
+- `middleware.ts` ではなく Next.js 16 の `proxy.ts` 規約を意識する。ただし MVP の管理画面認証は Server Component の admin layout と admin Server Actions のサーバー側ガードで実装する。
+- Node.js 20.9+、TypeScript 5.1+ を前提にする。
+- Turbopack がデフォルトであるため、Webpack 前提の設定に依存しない。
+- `next lint` ではなく ESLint CLI を使う。
+
 ## 3. Routing and User Flows
 
 ### 3.1 Routes
@@ -201,11 +314,16 @@ Decision:
 Decision:
 
 - D1 を主データストアとする。
-- 建物一覧は D1 に seed する。
+- DB アクセスには Drizzle ORM を採用する。
+- Drizzle schema をアプリケーション上のDBスキーマのソースオブトゥルースとする。
+- migration は Drizzle migrations で生成・管理する。
+- 建物一覧は Drizzle seed script で D1 に投入する。
 - MVP では建物一覧の管理画面編集は対象外とする。
 - 給水機の水温種別は JOIN テーブルで保持する。
 - 給水機の状態は 1 つの status として保持する。
 - 給水機ピン座標はキャンパスごとの地図画像に対する相対座標で保持する。
+
+`src/lib/db/schema.ts` に Drizzle の table definitions を集約し、`src/lib/db/types.ts` で `InferSelectModel` / `InferInsertModel` 由来の型を公開する。機能ごとの `queries.ts` は、この schema と型を参照して Drizzle query を実行する。
 
 ID は実装と運用で読みやすい文字列 ID を基本とする。給水機は `station_001` のような安定 ID を使い、QR コードや短縮リンクの対応表から参照されても変更しない。
 
@@ -688,7 +806,8 @@ Decision:
 - サーバー側で入力パスワードに salt を適用し、ハッシュ化する。
 - `ADMIN_PASSWORD_HASH` と定数時間比較する。
 - 一致した場合、署名付きセッション Cookie を発行する。
-- `/admin` 配下では Cookie を検証してログイン状態を確認する。
+- `/admin` 配下では Server Component の `src/app/admin/layout.tsx` で Cookie を検証してログイン状態を確認する。
+- 未ログインの場合は、admin UI をレンダリングせずサーバー側で `/admin/login` に `redirect` する。
 - ログアウト時は Cookie を削除する。
 
 ハッシュ方式:
@@ -705,6 +824,16 @@ Cookie 属性:
 - `Secure`
 - `SameSite=Lax` または `SameSite=Strict`
 - 適切な有効期限
+
+Admin route protection:
+
+- MVP では `src/app/admin/layout.tsx` によるページ閲覧保護を必須とする。
+- `admin/layout.tsx` は Server Component とし、Client Component の `useEffect` などで認証判定しない。
+- 未認証時はサーバー側で `redirect("/admin/login")` するため、admin UI のフリッカーを発生させない。
+- `/admin/login` は admin layout の保護対象外にする。
+- admin 用 Server Actions は、処理冒頭で必ず `requireAdminSession()` を呼ぶ。
+- ページ表示の保護と Server Actions の操作保護を両方行い、UI 非表示だけに依存しない。
+- `proxy.ts` による `/admin/*` の追加保護は MVP 必須ではなく、OpenNext / Cloudflare 上での挙動検証後に必要であれば追加する。
 
 ### 9.3 Security Limitations
 
@@ -942,23 +1071,24 @@ MVP では共通利用を許容するもの:
 
 Resend を共通利用する場合、開発環境から送るメール件名には `[DEV]` を付ける。イベント保存時も `environment` を保存し、本番データと開発データを混同しない。
 
-### 13.2.1 D1 Migration and Seed
+### 13.2.1 Drizzle Migration and Seed
 
 Decision:
 
-- D1 migration は Wrangler migrations で管理する。
-- 初期データ投入は seed scripts で管理する。
+- D1 migration は Drizzle migrations で管理する。
+- 初期データ投入は Drizzle schema を参照する seed scripts で管理する。
 - production と development の D1 database は分離する。
 - アプリ内の D1 binding 名は環境に関わらず `DB` で統一する。
 - `wrangler env` により `development` / `production` の接続先 D1 を切り替える。
 
 運用方針:
 
-- schema 変更は migration として履歴管理する。
-- 初期キャンパス、建物、給水機データは seed scripts で投入する。
+- schema 変更は Drizzle schema 変更と Drizzle migrations として履歴管理する。
+- 初期キャンパス、建物、給水機データは Drizzle seed scripts で投入する。
 - 本番運用開始後の seed は破壊的に実行しない。
 - 本番 migration 前に development で適用確認する。
 - seed scripts は冪等性を意識し、同じ seed を複数回実行しても重複が発生しない設計にする。
+- migration 生成・適用コマンドは実装時に `drizzle-kit` と Cloudflare D1 の運用に合わせて定義する。
 
 ### 13.3 Domain
 
@@ -1062,7 +1192,7 @@ MVP の完了条件:
 
 Fallback 方針:
 
-- 管理画面が遅延した場合、給水機データや座標は seed / DB 直接登録で運用する。
+- 管理画面が遅延した場合、給水機データや座標は Drizzle seed script または D1 コンソールでの手動登録で運用する。
 - ユーザー向け表示と QR 導線を優先する。
 - 管理画面は状態更新と緊急連絡確認に絞る。
 
@@ -1107,7 +1237,7 @@ MVP に LP、マップ、投票、緊急連絡、管理画面、QR、ピンチ�
 Mitigation:
 
 - ユーザー向け体験を最優先する。
-- 管理画面の一部は seed / DB 直接運用にフォールバックできるようにする。
+- 管理画面の一部は Drizzle seed script または D1 コンソールでの手動運用にフォールバックできるようにする。
 - ビジュアル座標エディタはクリック設定を最小ラインにする。
 - 高度な分析や自動化は MVP 後に回す。
 
@@ -1203,7 +1333,7 @@ Mitigation:
 
 - キャリボトから初期給水機一覧を最優先で受け取る。
 - 不明な給水機は MVP では表示しない。
-- 後から管理画面または seed 更新で追加できるようにする。
+- 後から管理画面または Drizzle seed script 更新で追加できるようにする。
 - 初期データには「確認済み」かどうかを運用メモで残す。
 
 ### 15.9 Email Deliverability Risk
@@ -1225,14 +1355,26 @@ Mitigation:
 
 Risk:
 
-D1 migration や seed 実行時に、本番の給水機・投票・緊急連絡データを誤って壊す可能性がある。
+Drizzle migrations や seed scripts 実行時に、本番の給水機・投票・緊急連絡データを誤って壊す可能性がある。
 
 Mitigation:
 
 - production と development の D1 を分離する。
 - seed は初期マスタ投入用とし、本番運用後の破壊的 seed を避ける。
-- migration は後方互換を意識し、既存データ削除を伴う変更を避ける。
+- Drizzle migration は後方互換を意識し、既存データ削除を伴う変更を避ける。
 - 本番適用前に development で migration を検証する。
+
+### 15.11 Drizzle and D1 Integration Risk
+
+Risk:
+
+OpenNext for Cloudflare 上で、Drizzle ORM、Cloudflare D1 binding、Server Actions の組み合わせに想定外の制約が出る可能性がある。
+
+Mitigation:
+
+- 実装初期に Drizzle client 生成、基本 SELECT / INSERT / UPDATE、JOIN、migration 適用、seed 実行をスパイクする。
+- D1 binding はグローバルに固定せず、リクエストや実行環境から受け取った `D1Database` を `getDb(d1)` に渡して Drizzle client を生成する。
+- Drizzle で表現しづらいクエリが出た場合は、該当箇所のみ SQL template / raw SQL の利用を許容する。
 
 ## 16. Open Items
 
@@ -1246,15 +1388,17 @@ Mitigation:
 - QR コード掲示物に短縮 URL を文字列として併記するか。
 - 公開時の最終ドメイン。
 
-### 16.3 Tchnical Open Items
+### 16.2 Technical Open Items
 
 - OpenNext for Cloudflare の細かな設定値。
+- Drizzle Kit / Cloudflare D1 の具体コマンドと設定。
 - PBKDF2-SHA256 の iteration 数。
 - レート制限の初期閾値。
 - `react-zoom-pan-pinch` と相対座標ピン表示の実機検証結果。
 - Resend の独自ドメイン認証をいつ実施するか。
+- `proxy.ts` による admin route の追加保護を Post-MVP で導入するか。
 
-### 16.4 Operational Open Items
+### 16.3 Operational Open Items
 
 - 公開後の給水機情報更新責任者。
 - 緊急連絡を受けた後の対応フロー。
@@ -1268,7 +1412,9 @@ Mitigation:
 実装開始時は以下の順で進める。
 
 - Next.js + Cloudflare + D1 の最小構成を作る。
-- `campuses`, `buildings`, `stations` の migration と seed を作る。
+- `src/app`, `src/features`, `src/lib`, `src/components` の基本ディレクトリを作る。
+- Drizzle schema と Drizzle migrations を作る。
+- `campuses`, `buildings`, `stations` の seed script を作る。
 - `/map` で地図画像とピンを表示する。
 - 給水機詳細を表示する。
 - 管理画面ログインを実装する。
@@ -1285,8 +1431,10 @@ Mitigation:
 早期に検証すべき項目:
 
 - OpenNext for Cloudflare で Route Handlers と D1 が問題なく動くか。
+- Next.js 16 の async `params` / `searchParams`、async `cookies()` / `headers()` の扱いが OpenNext 上で問題ないか。
+- Drizzle ORM が Cloudflare D1 binding と OpenNext 上で問題なく動くか。
+- Drizzle migrations / seed scripts / preview DB 分離が運用しやすいか。
 - セッション Cookie の発行・検証が Cloudflare 上で安定するか。
 - Resend 送信が Cloudflare 環境から動くか。
 - ピンチズーム・パン時に画像とピンの位置がずれないか。
-- D1 の migration / seed / preview DB 分離が運用しやすいか。
 
