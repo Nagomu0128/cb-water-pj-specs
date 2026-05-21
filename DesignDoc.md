@@ -203,7 +203,7 @@ Decision:
 - D1 を主データストアとする。
 - 建物一覧は D1 に seed する。
 - MVP では建物一覧の管理画面編集は対象外とする。
-- 給水機の水温種別は JSON 配列で保持する。
+- 給水機の水温種別は JOIN テーブルで保持する。
 - 給水機の状態は 1 つの status として保持する。
 - 給水機ピン座標はキャンパスごとの地図画像に対する相対座標で保持する。
 
@@ -253,7 +253,6 @@ ID は実装と運用で読みやすい文字列 ID を基本とする。給水�
 - `relative_x`: real。地図画像上の X 相対座標。0.0 から 1.0。
 - `relative_y`: real。地図画像上の Y 相対座標。0.0 から 1.0。
 - `status`: text。`available`, `stopped`, `broken`
-- `temperature_types`: text。JSON 配列。例: `["cold","normal"]`
 - `short_link_id`: text, nullable。`url.gdgs.jp` 側の短縮リンク識別子。
 - `short_link_url`: text, nullable。
 - `is_public`: integer。公開対象かどうか。
@@ -269,7 +268,29 @@ MVP の必須項目は、キャンパス、建物、名称、相対座標、状�
 - `campus_id`, `building_id` にインデックスを貼る。
 - `short_link_url` は登録される場合、一意にする。
 
-### 4.5 installation_targets
+### 4.5 station_temperatures
+
+給水機が対応する水温種別を保持する JOIN テーブル。
+
+- `station_id`: text
+- `temperature_type`: text。`cold`, `normal`, `hot`
+- `created_at`: datetime
+
+主キー:
+
+- `station_id`, `temperature_type`
+
+推奨制約:
+
+- `temperature_type` は `cold`, `normal`, `hot` のいずれかに制限する。
+- `station_id` にインデックスを貼る。
+- `temperature_type` にインデックスを貼る。
+
+このテーブルにより、温水対応の給水機だけを抽出する、キャンパスごとの水温対応数を集計する、といった検索・集計を行いやすくする。
+
+MVP では水温ごとの個別状態は持たない。必要になった場合は、このテーブルに `status` を追加するか、別途 `station_temperature_statuses` テーブルへ移行する。
+
+### 4.6 installation_targets
 
 設置希望の建物単位集約を表す。建物ごとに 1 件を基本とする。
 
@@ -287,7 +308,7 @@ MVP の必須項目は、キャンパス、建物、名称、相対座標、状�
 - `campus_id`, `building_id` の組み合わせは一意にする。
 - `vote_count` は `installation_votes` から再集計可能だが、MVP では一覧表示を軽くするためキャッシュ値として保持する。
 
-### 4.6 installation_votes
+### 4.7 installation_votes
 
 投票履歴を保持する。
 
@@ -305,7 +326,7 @@ Cookie の生値は DB に保存しない。DB にはハッシュ化した識別
 - `target_id`, `created_at`
 - `target_id`, `voter_token_hash`, `created_at`
 
-### 4.7 installation_comments
+### 4.8 installation_comments
 
 設置希望に紐づく管理者向けコメントを保持する。
 
@@ -322,7 +343,7 @@ MVP ではコメントを一般公開しない。公開側にはキャンパス�
 - `target_id`, `created_at`
 - `deleted_at`
 
-### 4.8 emergency_contacts
+### 4.9 emergency_contacts
 
 緊急連絡を保持する。
 
@@ -343,7 +364,7 @@ MVP では写真添付を扱わない。
 - `created_at`
 - `deleted_at`
 
-### 4.9 analytics_events
+### 4.10 analytics_events
 
 必要最小限のイベントを保存する。
 
@@ -373,7 +394,7 @@ MVP で優先して保存するイベントは以下とする。
 - `station_id`, `created_at`
 - `environment`, `created_at`
 
-### 4.10 admin_audit_events
+### 4.11 admin_audit_events
 
 MVP では詳細な監査ログは対象外だが、基本ログだけは軽く残せる構成にする。
 
@@ -473,7 +494,7 @@ Decision:
 Decision:
 
 - 水温種別は複数選択可能とする。
-- DB では JSON 配列として保持する。
+- DB では `station_temperatures` JOIN テーブルとして保持する。
 
 表示名:
 
@@ -481,7 +502,7 @@ Decision:
 - `normal`: 常温水
 - `hot`: 温水
 
-MVP では水温ごとの個別状態は持たない。例えば「冷水は利用可能だが温水だけ停止中」のような表現が必要になった場合は、MVP 後に `station_temperature_statuses` のような正規化テーブルを検討する。
+MVP では水温ごとの個別状態は持たない。例えば「冷水は利用可能だが温水だけ停止中」のような表現が必要になった場合は、`station_temperatures` に `status` を追加するか、別途 `station_temperature_statuses` テーブルへ移行する。
 
 ### 6.3 Station Detail
 
